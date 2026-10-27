@@ -1,0 +1,74 @@
+name: docker
+
+# Builds the image from the published npm package, tests it over stdio, then publishes it to Docker Hub.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: tresor4k/calculiva-mcp
+  VERSION: "0.2.0"
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (amd64, local)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          build-args: VERSION=${{ env.VERSION }}
+          tags: calculiva-mcp:test
+
+      - name: Test the image
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id calculiva-mcp:test -u)" = "1000"
+          {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"plan_wallpaper_order","arguments":{"walls":[{"width":"12 ft","height":"8 ft"}],"rollWidth":"20.5 in","rollLength":"33 ft","repeat":"21 in","match":"half-drop"}}}'
+            sleep 10
+          } | docker run -i --rm calculiva-mcp:test > out.jsonl
+          jq -e -s --arg v "$VERSION" '
+            (map(select(.id == 1))[0].result.serverInfo.version == $v)
+            and ((map(select(.id == 2))[0].result.tools | map(.name) | sort) == ["build_order_sheet","plan_flooring_order","plan_trim_order","plan_wallpaper_order"])
+            and ((map(select(.id == 3))[0].result.structuredContent.rollsToBuy) > 0)
+          ' out.jsonl
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ env.VERSION }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.title=calculiva-mcp
+            org.opencontainers.image.description=Calculiva Cut Planner MCP server (stdio): flooring, trim and wallpaper orders from computed cut layouts. Read-only, no account.
+            org.opencontainers.image.url=https://calculiva.com/how-we-calculate/#mcp-server
+            org.opencontainers.image.source=https://github.com/calculiva/calculiva-mcp
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Inspect the published image
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
